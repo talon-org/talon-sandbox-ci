@@ -1,0 +1,87 @@
+name: build-go-binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref in agent-sandbox-platform to build (branch / tag / sha)"
+        required: false
+        default: "main"
+  repository_dispatch:
+    types: [platform-push]
+
+# talon-sdk-go ships libtalon.so for linux_amd64 only (no linux_arm64).
+# Until upstream adds arm64, this workflow only builds linux/amd64.
+
+jobs:
+  build:
+    name: build ${{ matrix.binary }} (linux/amd64)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        binary: [sandbox-api, sandbox-worker, sandbox-bootstrap]
+    steps:
+      - name: Checkout private platform repo
+        uses: actions/checkout@v4
+        with:
+          repository: talon-org/agent-sandbox-platform
+          token: ${{ secrets.GH_PAT }}
+          ref: ${{ github.event.inputs.ref || github.event.client_payload.ref || 'main' }}
+          path: platform
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: platform/go.mod
+          cache-dependency-path: platform/go.sum
+
+      - name: Resolve version
+        id: ver
+        working-directory: platform
+        run: |
+          VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        working-directory: platform
+        env:
+          CGO_ENABLED: 1
+          GOOS: linux
+          GOARCH: amd64
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          mkdir -p ../out
+          go build -trimpath \
+            -ldflags="-s -w -X main.version=${VERSION}" \
+            -o "../out/${{ matrix.binary }}" \
+            "./cmd/${{ matrix.binary }}"
+
+      - name: Locate libtalon.so
+        id: libtalon
+        working-directory: platform
+        run: |
+          LIBPATH="$(find "$(go env GOMODCACHE)/github.com/darkmice/talon-sdk-go"@*/lib/linux_amd64 -name 'libtalon.so' 2>/dev/null | head -1)"
+          if [ -z "$LIBPATH" ]; then
+            echo "::error::libtalon.so not found in module cache"
+            exit 1
+          fi
+          cp "$LIBPATH" ../out/libtalon.so
+          echo "libtalon=$LIBPATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}-linux-amd64
+          path: out/${{ matrix.binary }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload libtalon.so (once, by sandbox-api job)
+        if: matrix.binary == 'sandbox-api'
+        uses: actions/upload-artifact@v4
+        with:
+          name: libtalon-linux-amd64
+          path: out/libtalon.so
+          if-no-files-found: error
+          retention-days: 14

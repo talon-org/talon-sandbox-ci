@@ -1,0 +1,70 @@
+name: docker-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref in agent-sandbox-platform to build (branch / tag / sha)"
+        required: false
+        default: "main"
+      tag:
+        description: "Image tag to push (default: ref name; use vX.Y.Z for releases)"
+        required: false
+        default: ""
+  repository_dispatch:
+    types: [platform-tag]
+
+jobs:
+  image:
+    name: build + push ghcr.io/talon-org/agent-sandbox
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout private platform repo
+        uses: actions/checkout@v4
+        with:
+          repository: talon-org/agent-sandbox-platform
+          token: ${{ secrets.GH_PAT }}
+          ref: ${{ github.event.inputs.ref || github.event.client_payload.ref || 'main' }}
+
+      - name: Resolve image tag
+        id: meta
+        run: |
+          REF="${{ github.event.inputs.ref || github.event.client_payload.ref || 'main' }}"
+          INPUT_TAG="${{ github.event.inputs.tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            # Sanitise ref into a Docker tag (slashes -> dashes)
+            TAG="$(echo "$REF" | tr '/' '-')"
+          fi
+          VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/talon-org/agent-sandbox:${{ steps.meta.outputs.tag }}
+            ghcr.io/talon-org/agent-sandbox:latest
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

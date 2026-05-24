@@ -1,0 +1,187 @@
+name: release-bundle
+
+# Builds the systemd quickstart tarball + 3 standalone binaries + libtalon.so,
+# then publishes them as a GitHub Release on the private platform repo.
+#
+# Triggers:
+#   * repository_dispatch (platform-tag)  — fired by the platform repo when a vX.Y.Z tag is pushed
+#   * workflow_dispatch                   — manual: pick a ref, optionally toggle release publish
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to bundle (use a vX.Y.Z tag for a real release)"
+        required: true
+        default: "main"
+      release:
+        description: "Publish a GitHub Release on the platform repo (ref must be a vX.Y.Z tag)"
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [platform-tag]
+
+jobs:
+  bundle:
+    name: build + tarball + release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Resolve ref
+        id: refresolve
+        run: |
+          REF="${{ github.event.inputs.ref || github.event.client_payload.ref }}"
+          if [ -z "$REF" ]; then REF=main; fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout private platform repo
+        uses: actions/checkout@v4
+        with:
+          repository: talon-org/agent-sandbox-platform
+          token: ${{ secrets.GH_PAT }}
+          ref: ${{ steps.refresolve.outputs.ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Set up Node + pnpm
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install -g pnpm@9
+
+      - name: Resolve version
+        id: ver
+        run: |
+          VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build SPA (best effort)
+        run: |
+          if [ -x scripts/build/sync-console.sh ]; then
+            bash scripts/build/sync-console.sh
+          elif [ -d web/console ]; then
+            cd web/console
+            pnpm install --frozen-lockfile
+            pnpm build
+          else
+            echo "no console SPA, skipping"
+          fi
+
+      - name: Build Linux binaries
+        env:
+          CGO_ENABLED: 1
+          GOOS: linux
+          GOARCH: amd64
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          mkdir -p dist/stage/bin
+          for cmd in sandbox-api sandbox-worker sandbox-bootstrap; do
+            go build -trimpath \
+              -ldflags="-s -w -X main.version=${VERSION}" \
+              -o "dist/stage/bin/$cmd" \
+              "./cmd/$cmd"
+          done
+          LIBPATH="$(find "$(go env GOMODCACHE)/github.com/darkmice/talon-sdk-go"@*/lib/linux_amd64 -name 'libtalon.so' | head -1)"
+          cp "$LIBPATH" dist/stage/bin/libtalon.so
+
+      - name: Stage deploy materials
+        run: |
+          STAGE=dist/stage
+          mkdir -p "$STAGE/deploy/systemd" "$STAGE/docs/deployment"
+          cp -a deploy/systemd/*.service "$STAGE/deploy/systemd/" || true
+          cp -a deploy/systemd/env-example "$STAGE/deploy/systemd/" || true
+          for s in install.sh preflight.sh quickstart.sh; do
+            if [ -f "deploy/systemd/$s" ]; then
+              cp -a "deploy/systemd/$s" "$STAGE/deploy/systemd/$s"
+              chmod +x "$STAGE/deploy/systemd/$s"
+            fi
+          done
+          [ -f docs/deployment/single-node-systemd.md ] && \
+            cp -a docs/deployment/single-node-systemd.md "$STAGE/docs/deployment/" || true
+          [ -d docs/deployment/reverse-proxy-examples ] && \
+            cp -a docs/deployment/reverse-proxy-examples "$STAGE/docs/deployment/" || true
+          [ -d web/console/dist ] && {
+            mkdir -p "$STAGE/web/console"
+            cp -a web/console/dist "$STAGE/web/console/dist"
+          } || true
+          [ -f README.md ] && cp -a README.md "$STAGE/README.md" || true
+          echo "${{ steps.ver.outputs.version }}" > "$STAGE/VERSION"
+
+      - name: Tarball + standalone assets + sha256
+        id: pack
+        run: |
+          NAME="agent-sandbox-${{ steps.ver.outputs.version }}-linux-amd64"
+          mv dist/stage "dist/$NAME"
+          cd dist
+          tar czf "$NAME.tar.gz" "$NAME"
+          sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+
+          # Per-binary assets so users can download just one without untarring
+          for cmd in sandbox-api sandbox-worker sandbox-bootstrap; do
+            cp "$NAME/bin/$cmd" "$cmd-${{ steps.ver.outputs.version }}-linux-amd64"
+            sha256sum "$cmd-${{ steps.ver.outputs.version }}-linux-amd64" \
+              > "$cmd-${{ steps.ver.outputs.version }}-linux-amd64.sha256"
+          done
+          cp "$NAME/bin/libtalon.so" "libtalon-${{ steps.ver.outputs.version }}-linux-amd64.so"
+          sha256sum "libtalon-${{ steps.ver.outputs.version }}-linux-amd64.so" \
+            > "libtalon-${{ steps.ver.outputs.version }}-linux-amd64.so.sha256"
+
+          ls -lh
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/sandbox-*-linux-amd64
+            dist/libtalon-*-linux-amd64.so
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Decide whether to publish a release
+        id: rel
+        run: |
+          REF="${{ steps.refresolve.outputs.ref }}"
+          # repository_dispatch always means a tag push from the platform repo
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            PUBLISH=true
+          # manual: respect the boolean input
+          elif [ "${{ github.event.inputs.release }}" = "true" ]; then
+            PUBLISH=true
+          else
+            PUBLISH=false
+          fi
+          # Sanity check: a release needs a vX.Y.Z tag
+          if [ "$PUBLISH" = "true" ] && ! echo "$REF" | grep -Eq '^v[0-9]+\.'; then
+            echo "::warning::ref '$REF' is not a vX.Y.Z tag — skipping release publish"
+            PUBLISH=false
+          fi
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release on platform repo
+        if: ${{ steps.rel.outputs.publish == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        working-directory: dist
+        run: |
+          TAG="${{ steps.refresolve.outputs.ref }}"
+          # Create release if missing; harmless if it already exists
+          gh release create "$TAG" \
+            --repo talon-org/agent-sandbox-platform \
+            --title "$TAG" \
+            --notes "Linux/amd64 build for $TAG. See CHANGELOG.md for details." \
+            2>/dev/null || true
+          # Upload (or replace) all artifacts
+          gh release upload "$TAG" \
+            --repo talon-org/agent-sandbox-platform \
+            --clobber \
+            *.tar.gz *.sha256 \
+            sandbox-*-linux-amd64 \
+            libtalon-*-linux-amd64.so
