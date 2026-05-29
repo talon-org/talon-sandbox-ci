@@ -13,6 +13,10 @@ on:
         description: "Git ref to bundle (use a vX.Y.Z tag for a real release)"
         required: true
         default: "main"
+      console-ref:
+        description: "talon-sandbox-console ref (the SPA embedded into sandbox-api)"
+        required: false
+        default: "main"
       release:
         description: "Publish a GitHub Release on the platform repo (ref must be a vX.Y.Z tag)"
         type: boolean
@@ -34,18 +38,26 @@ jobs:
           if [ -z "$REF" ]; then REF=main; fi
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout private platform repo
+      - name: Checkout platform repo (to ./platform)
         uses: actions/checkout@v4
         with:
           repository: talon-org/agent-sandbox-platform
           token: ${{ secrets.GH_PAT }}
           ref: ${{ steps.refresolve.outputs.ref }}
+          path: platform
+
+      - name: Checkout console repo (to ./console)
+        uses: actions/checkout@v4
+        with:
+          repository: talon-org/talon-sandbox-console
+          ref: ${{ github.event.inputs.console-ref || 'main' }}
+          path: console
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
+          go-version-file: platform/go.mod
+          cache-dependency-path: platform/go.sum
 
       - name: Set up Node + pnpm
         uses: actions/setup-node@v4
@@ -55,40 +67,43 @@ jobs:
 
       - name: Resolve version
         id: ver
+        working-directory: platform
         run: |
           VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Build SPA (best effort)
+      - name: Build console SPA and embed into platform
         run: |
-          if [ -x scripts/build/sync-console.sh ]; then
-            bash scripts/build/sync-console.sh
-          elif [ -d web/console ]; then
-            cd web/console
-            pnpm install --frozen-lockfile
-            pnpm build
-          else
-            echo "no console SPA, skipping"
-          fi
+          cd console
+          pnpm install --frozen-lockfile
+          pnpm build
+          cd ..
+          rm -rf platform/internal/api/console/dist
+          mkdir -p platform/internal/api/console/dist
+          cp -R console/dist/. platform/internal/api/console/dist/
+          touch platform/internal/api/console/dist/.keep
 
       - name: Build Linux binaries
+        working-directory: platform
         env:
           CGO_ENABLED: 1
           GOOS: linux
           GOARCH: amd64
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          mkdir -p dist/stage/bin
+          mkdir -p dist/stage/bin dist/stage/lib
           for cmd in sandbox-api sandbox-worker sandbox-bootstrap; do
             go build -trimpath \
               -ldflags="-s -w -X main.version=${VERSION}" \
               -o "dist/stage/bin/$cmd" \
               "./cmd/$cmd"
           done
+          # libtalon.so 装到 lib/,跟 build-bundle.sh / install.sh 约定一致
           LIBPATH="$(find "$(go env GOMODCACHE)/github.com/darkmice/talon-sdk-go"@*/lib/linux_amd64 -name 'libtalon.so' | head -1)"
-          cp "$LIBPATH" dist/stage/bin/libtalon.so
+          cp "$LIBPATH" dist/stage/lib/libtalon.so
 
       - name: Stage deploy materials
+        working-directory: platform
         run: |
           STAGE=dist/stage
           mkdir -p "$STAGE/deploy/systemd" "$STAGE/docs/deployment"
@@ -104,15 +119,18 @@ jobs:
             cp -a docs/deployment/single-node-systemd.md "$STAGE/docs/deployment/" || true
           [ -d docs/deployment/reverse-proxy-examples ] && \
             cp -a docs/deployment/reverse-proxy-examples "$STAGE/docs/deployment/" || true
-          [ -d web/console/dist ] && {
+          # console SPA dist (用刚才 embed 进 internal/api/console/dist 的同一份),
+          # 排障时方便对照 binary 里嵌的版本。
+          if [ -d internal/api/console/dist ]; then
             mkdir -p "$STAGE/web/console"
-            cp -a web/console/dist "$STAGE/web/console/dist"
-          } || true
+            cp -a internal/api/console/dist "$STAGE/web/console/dist"
+          fi
           [ -f README.md ] && cp -a README.md "$STAGE/README.md" || true
           echo "${{ steps.ver.outputs.version }}" > "$STAGE/VERSION"
 
       - name: Tarball + standalone assets + sha256
         id: pack
+        working-directory: platform
         run: |
           NAME="agent-sandbox-${{ steps.ver.outputs.version }}-linux-amd64"
           mv dist/stage "dist/$NAME"
@@ -126,7 +144,7 @@ jobs:
             sha256sum "$cmd-${{ steps.ver.outputs.version }}-linux-amd64" \
               > "$cmd-${{ steps.ver.outputs.version }}-linux-amd64.sha256"
           done
-          cp "$NAME/bin/libtalon.so" "libtalon-${{ steps.ver.outputs.version }}-linux-amd64.so"
+          cp "$NAME/lib/libtalon.so" "libtalon-${{ steps.ver.outputs.version }}-linux-amd64.so"
           sha256sum "libtalon-${{ steps.ver.outputs.version }}-linux-amd64.so" \
             > "libtalon-${{ steps.ver.outputs.version }}-linux-amd64.so.sha256"
 
@@ -138,10 +156,10 @@ jobs:
         with:
           name: ${{ steps.pack.outputs.name }}
           path: |
-            dist/*.tar.gz
-            dist/*.sha256
-            dist/sandbox-*-linux-amd64
-            dist/libtalon-*-linux-amd64.so
+            platform/dist/*.tar.gz
+            platform/dist/*.sha256
+            platform/dist/sandbox-*-linux-amd64
+            platform/dist/libtalon-*-linux-amd64.so
           if-no-files-found: error
           retention-days: 30
 
@@ -169,7 +187,7 @@ jobs:
         if: ${{ steps.rel.outputs.publish == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
-        working-directory: dist
+        working-directory: platform/dist
         run: |
           TAG="${{ steps.refresolve.outputs.ref }}"
           # Create release if missing; harmless if it already exists

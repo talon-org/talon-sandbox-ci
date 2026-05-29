@@ -3,25 +3,21 @@ name: console-spa
 on:
   workflow_dispatch:
     inputs:
-      ref:
-        description: "Git ref in agent-sandbox-platform to build (branch / tag / sha)"
+      console-ref:
+        description: "Git ref in talon-sandbox-console to build (branch / tag / sha)"
         required: false
         default: "main"
 
 jobs:
   spa:
-    name: build web/console (Vite)
+    name: build talon-sandbox-console (Vite)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout private platform repo
+      - name: Checkout console repo
         uses: actions/checkout@v4
         with:
-          repository: talon-org/agent-sandbox-platform
-          token: ${{ secrets.GH_PAT }}
-          ref: ${{ github.event.inputs.ref || 'main' }}
-          sparse-checkout: |
-            web/console
-            scripts/build
+          repository: talon-org/talon-sandbox-console
+          ref: ${{ github.event.inputs.console-ref || 'main' }}
 
       - name: Set up Node + pnpm
         uses: actions/setup-node@v4
@@ -30,7 +26,6 @@ jobs:
       - run: npm install -g pnpm@9
 
       - name: Install + build
-        working-directory: web/console
         run: |
           pnpm install --frozen-lockfile
           pnpm build
@@ -39,6 +34,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: console-dist
-          path: web/console/dist
+          path: dist
           if-no-files-found: error
           retention-days: 14
