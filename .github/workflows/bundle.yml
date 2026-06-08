@@ -13,10 +13,6 @@ on:
         description: "Git ref to bundle (use a vX.Y.Z tag for a real release)"
         required: true
         default: "main"
-      console-ref:
-        description: "talon-sandbox-console ref (the SPA embedded into sandbox-api)"
-        required: false
-        default: "main"
       release:
         description: "Publish a GitHub Release on the platform repo (ref must be a vX.Y.Z tag)"
         type: boolean
@@ -46,24 +42,11 @@ jobs:
           ref: ${{ steps.refresolve.outputs.ref }}
           path: platform
 
-      - name: Checkout console repo (to ./console)
-        uses: actions/checkout@v4
-        with:
-          repository: talon-org/talon-sandbox-console
-          ref: ${{ github.event.inputs.console-ref || 'main' }}
-          path: console
-
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: platform/go.mod
           cache-dependency-path: platform/go.sum
-
-      - name: Set up Node + pnpm
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - run: npm install -g pnpm@9
 
       - name: Resolve version
         id: ver
@@ -72,16 +55,9 @@ jobs:
           VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Build console SPA and embed into platform
-        run: |
-          cd console
-          pnpm install --frozen-lockfile
-          pnpm build
-          cd ..
-          rm -rf platform/internal/api/console/dist
-          mkdir -p platform/internal/api/console/dist
-          cp -R console/dist/. platform/internal/api/console/dist/
-          touch platform/internal/api/console/dist/.keep
+      # 注:console SPA 不再 embed 进 sandbox-api(platform a38dc62 起 api 是纯
+      # /v1/* 接口服务,前端独立仓 talon-sandbox-console 由 Caddy file_server 上线)。
+      # 故 bundle 只构建 Go 二进制 + libtalon.so,不再 checkout/build/embed console。
 
       - name: Build Linux binaries
         working-directory: platform
@@ -119,12 +95,6 @@ jobs:
             cp -a docs/deployment/single-node-systemd.md "$STAGE/docs/deployment/" || true
           [ -d docs/deployment/reverse-proxy-examples ] && \
             cp -a docs/deployment/reverse-proxy-examples "$STAGE/docs/deployment/" || true
-          # console SPA dist (用刚才 embed 进 internal/api/console/dist 的同一份),
-          # 排障时方便对照 binary 里嵌的版本。
-          if [ -d internal/api/console/dist ]; then
-            mkdir -p "$STAGE/web/console"
-            cp -a internal/api/console/dist "$STAGE/web/console/dist"
-          fi
           [ -f README.md ] && cp -a README.md "$STAGE/README.md" || true
           echo "${{ steps.ver.outputs.version }}" > "$STAGE/VERSION"
 
